@@ -1,0 +1,17 @@
+name: standard-curve-calculator
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.12
+  - pandas
+  - numpy
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - openpyxl
+  - argparse
+  - python-dateutil
+  - pillow
