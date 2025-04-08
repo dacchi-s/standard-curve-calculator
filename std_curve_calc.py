@@ -304,47 +304,12 @@ def process_standard_data(df):
     
     return concentrations, mean_values, sd_values, se_values, n_replicates
 
-def determine_best_fit(concentrations, mean_values, logger, verbose=False):
-    """
-    Determine the best fitting method based on AIC and RMSE
-    """
-    methods = ['linear', '4', '5']
-    best_method = None
-    best_metrics = None
-    best_y_fit = None
-    best_popt = None
-    best_formula = ""
-    best_fit_func = None
-    
-    for method in methods:
-        try:
-            init_params = get_initial_params(mean_values, concentrations) if method in ['4', '5'] else None
-            fit_func, popt, y_fit, n_params, formula = fit_curve(concentrations, mean_values, method, init_params, verbose)
-            metrics = calculate_fit_metrics(mean_values, y_fit, n_params)
-
-            if best_metrics is None or metrics['AIC'] < best_metrics['AIC']:
-                best_method = method
-                best_metrics = metrics
-                best_y_fit = y_fit
-                best_popt = popt
-                best_formula = formula
-                best_fit_func = fit_func
-            elif metrics['AIC'] == best_metrics['AIC'] and metrics['RMSE'] < best_metrics['RMSE']:
-                best_method = method
-                best_metrics = metrics
-                best_y_fit = y_fit
-                best_popt = popt
-                best_formula = formula
-                best_fit_func = fit_func
-
-        except RuntimeError:
-            logger.warning(f"Fitting failed for {method} method")
-    
-    return best_method, best_metrics, best_y_fit, best_popt, best_formula, best_fit_func
-
 def process_sample_data(df, empty_row_idx, logger):
     """
-    Process sample data and automatically determine replicates
+    Process sample data with three levels of statistics:
+    1. Individual measurements
+    2. Replicate statistics (identical sample names)
+    3. Group statistics (base names)
     """
     from scipy import stats as scipy_stats
     
@@ -352,17 +317,61 @@ def process_sample_data(df, empty_row_idx, logger):
     sample_data.columns = ['Sample', 'Absorbance']
     sample_data['Sample'] = sample_data['Sample'].astype(str)
     
-    name_warnings = validate_sample_names(sample_data)
-    for warning in name_warnings:
-        logger.warning(warning)
+    logger.debug(f"Loaded sample data (first 5 rows):\n{sample_data.head().to_string()}")
     
+    # Save original sample names
     sample_data['Original_Sample_Name'] = sample_data['Sample']
-    sample_data['Sample'] = sample_data['Sample'].apply(standardize_sample_names)
     
-    replicates_count = sample_data.groupby('Sample').size()
+    # Create base name for grouping (for statistics)
+    sample_data['Base_Sample_Name'] = sample_data['Sample'].apply(standardize_sample_names)
     
-    result_stats = []
+    logger.debug(f"Sample data after standardization (first 5 rows):\n{sample_data.head().to_string()}")
+    
+    # 1. Store results for each individual sample measurement
+    individual_results = []
+    for _, row in sample_data.iterrows():
+        individual_results.append({
+            'Sample': row['Sample'],  # Original sample name (with replicate identifier)
+            'Base_Sample_Name': row['Base_Sample_Name'],  # Base name for grouping
+            'Absorbance': row['Absorbance'],
+            'Original_Names': [row['Sample']],  # Keep as list for consistency
+            'Is_Group': False,  # Explicitly mark as individual sample
+            'Is_Replicate': False  # Not a replicate statistic
+        })
+    
+    # 2. Calculate replicate statistics (same exact sample name)
+    replicate_stats = []
     for sample, group in sample_data.groupby('Sample'):
+        # Only create replicate statistics if there are multiple measurements
+        if len(group) > 1:
+            mean_abs = group['Absorbance'].mean()
+            sd_abs = group['Absorbance'].std(ddof=1)
+            se_abs = sd_abs / np.sqrt(len(group))
+            
+            t_value = scipy_stats.t.ppf(0.975, len(group)-1)
+            ci_95 = t_value * se_abs
+            
+            cv_percent = (sd_abs / mean_abs * 100) if mean_abs != 0 else 0
+            
+            base_name = group['Base_Sample_Name'].iloc[0]  # All entries have same base name
+            
+            replicate_stats.append({
+                'Sample': sample,  # Original sample name with replicate number
+                'Base_Sample_Name': base_name,
+                'Absorbance_Mean': mean_abs,
+                'Absorbance_SD': sd_abs,
+                'Absorbance_SE': se_abs,
+                'N': len(group),
+                'CI_95': ci_95,
+                'CV_Percent': cv_percent,
+                'Original_Names': [sample] * len(group),
+                'Is_Group': False,  # Not a base group statistic
+                'Is_Replicate': True  # Mark as replicate statistic
+            })
+    
+    # 3. Calculate group statistics (base sample name)
+    group_stats = []
+    for sample, group in sample_data.groupby('Base_Sample_Name'):
         original_names = group['Original_Sample_Name'].tolist()
         n = len(group)
         mean_abs = group['Absorbance'].mean()
@@ -375,9 +384,9 @@ def process_sample_data(df, empty_row_idx, logger):
         else:
             ci_95 = 0
         
-        cv_percent = (sd_abs / mean_abs * 100) if n > 1 else 0
+        cv_percent = (sd_abs / mean_abs * 100) if n > 1 and mean_abs != 0 else 0
         
-        result_stats.append({
+        group_stats.append({
             'Sample': sample,
             'Absorbance_Mean': mean_abs,
             'Absorbance_SD': sd_abs,
@@ -385,10 +394,25 @@ def process_sample_data(df, empty_row_idx, logger):
             'N': n,
             'CI_95': ci_95,
             'CV_Percent': cv_percent,
-            'Original_Names': original_names
+            'Original_Names': original_names,
+            'Is_Group': True,  # Mark as group statistic
+            'Is_Replicate': False  # Not a replicate statistic
         })
     
-    return pd.DataFrame(result_stats)
+    logger.debug(f"Number of individual samples: {len(individual_results)}")
+    logger.debug(f"Number of replicate statistics: {len(replicate_stats)}")
+    logger.debug(f"Number of group statistics: {len(group_stats)}")
+    
+    # Combine all results
+    all_results = individual_results + replicate_stats + group_stats
+    result_df = pd.DataFrame(all_results)
+    
+    logger.debug(f"Combined DataFrame shape: {result_df.shape}")
+    logger.debug(f"Individual samples (first 3):\n{result_df[(~result_df['Is_Group']) & (~result_df['Is_Replicate'])].head(3).to_string() if not result_df.empty else 'Empty'}")
+    logger.debug(f"Replicate statistics (first 3):\n{result_df[result_df['Is_Replicate']].head(3).to_string() if not result_df.empty else 'Empty'}")
+    logger.debug(f"Group statistics (first 3):\n{result_df[result_df['Is_Group']].head(3).to_string() if not result_df.empty else 'Empty'}")
+    
+    return result_df
 
 def validate_data_quality(stats, cv_threshold=15):
     """
@@ -403,14 +427,23 @@ def validate_data_quality(stats, cv_threshold=15):
     """
     warnings = []
     
-    high_cv_samples = stats[stats['CV_Percent'] > cv_threshold]
+    # Check group and replicate statistics for high CV
+    if 'Is_Group' in stats.columns and 'Is_Replicate' in stats.columns:
+        check_stats = stats[(stats['Is_Group'] == True) | (stats['Is_Replicate'] == True)].copy()
+    elif 'Is_Group' in stats.columns:
+        check_stats = stats[stats['Is_Group'] == True].copy()
+    else:
+        check_stats = stats.copy()
+    
+    high_cv_samples = check_stats[check_stats['CV_Percent'] > cv_threshold]
     if not high_cv_samples.empty:
         for _, row in high_cv_samples.iterrows():
+            sample_type = "group" if row.get('Is_Group', False) else "replicate"
             warnings.append(
-                f"Warning: {row['Sample']} has CV of {row['CV_Percent']:.1f}% (threshold: {cv_threshold}%)"
+                f"Warning: {row['Sample']} ({sample_type}) has CV of {row['CV_Percent']:.1f}% (threshold: {cv_threshold}%)"
             )
     
-    single_samples = stats[stats['N'] == 1]
+    single_samples = check_stats[check_stats['N'] == 1]
     if not single_samples.empty:
         for _, row in single_samples.iterrows():
             warnings.append(
@@ -450,11 +483,18 @@ def create_and_save_plot(concentrations, mean_values, sd_values, sample_stats,
                 label=f"Fitted Curve ({method}PL)", 
                 color='red', linewidth=2)
     
-    for _, row in sample_stats.iterrows():
-        plt.errorbar(row['Concentration'], row['Absorbance_Mean'],
-                    yerr=row['Absorbance_SD'] if row['N'] > 1 else None,
-                    fmt='s', label=f"{row['Sample']} (n={row['N']})",
-                    capsize=5, markersize=8)
+    # Plot group statistics only
+    if 'Is_Group' in sample_stats.columns:
+        plot_stats = sample_stats[sample_stats['Is_Group'] == True].copy()
+    else:
+        plot_stats = sample_stats.copy()
+    
+    for _, row in plot_stats.iterrows():
+        if 'Concentration' in row and not pd.isna(row['Concentration']):
+            plt.errorbar(row['Concentration'], row['Absorbance_Mean'],
+                        yerr=row['Absorbance_SD'] if row['N'] > 1 else None,
+                        fmt='s', label=f"{row['Sample']} (n={row['N']})",
+                        capsize=5, markersize=8)
     
     plt.text(0.05, 0.95, formula, transform=plt.gca().transAxes, 
             fontsize=10, verticalalignment='top',
@@ -484,28 +524,78 @@ def create_and_save_plot(concentrations, mean_values, sd_values, sample_stats,
 
 def save_results(output_path, sample_stats, metrics, formula, concentrations, 
                 mean_values, sd_values, se_values, n_std_replicates, warnings, 
-                fit_func, method, popt, output_png_path, file_type='excel'):
+                fit_func, method, popt, output_png_path, file_type='excel', logger=None):
     """
-    Save analysis results to Excel/CSV file
+    Save analysis results to Excel/CSV file with three levels of results:
+    1. Individual measurements
+    2. Replicate statistics (same exact sample names)
+    3. Group statistics (base names)
     """
     output_path = Path(output_path)
+    
+    if logger:
+        logger.debug(f"Sample stats DataFrame shape: {sample_stats.shape}")
+        logger.debug(f"Is_Group column exists: {'Is_Group' in sample_stats.columns}")
+        logger.debug(f"Is_Replicate column exists: {'Is_Replicate' in sample_stats.columns}")
     
     if file_type == 'excel':
         workbook = openpyxl.Workbook()
         
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            # Sample analysis results
-            results_df = sample_stats.copy()
-            results_df['Original_Sample_Names'] = results_df['Original_Names'].apply(lambda x: ', '.join(x))
-            results_df = results_df.drop(columns=['Original_Names'])
-            results_df.to_excel(writer, sheet_name="Analysis_Results", index=False)
+            if 'Is_Group' in sample_stats.columns and 'Is_Replicate' in sample_stats.columns:
+                individual_results = sample_stats[(~sample_stats['Is_Group']) & (~sample_stats['Is_Replicate'])].copy()
+            else:
+                individual_results = pd.DataFrame()
+                
+            if not individual_results.empty:
+                available_cols = individual_results.columns.tolist()
+                desired_cols = ['Sample', 'Base_Sample_Name', 'Absorbance', 'Concentration']
+                individual_cols = [col for col in desired_cols if col in available_cols]
+                
+                if logger:
+                    logger.debug(f"Selected columns for individual results: {individual_cols}")
+                
+                individual_results = individual_results[individual_cols].copy()
+                individual_results.to_excel(writer, sheet_name="Individual_Results", index=False)
+                
+                if logger:
+                    logger.debug("Individual_Results sheet created successfully")
+            
+            if 'Is_Replicate' in sample_stats.columns:
+                replicate_results = sample_stats[sample_stats['Is_Replicate'] == True].copy()
+                
+                if not replicate_results.empty:
+                    drop_cols = ['Is_Group', 'Is_Replicate']
+                    replicate_results = replicate_results.drop(columns=[col for col in drop_cols if col in replicate_results.columns])
+                    replicate_results.to_excel(writer, sheet_name="Replicate_Statistics", index=False)
+                    
+                    if logger:
+                        logger.debug("Replicate_Statistics sheet created successfully")
+            
+            if 'Is_Group' in sample_stats.columns:
+                group_results = sample_stats[sample_stats['Is_Group'] == True].copy()
+                
+                if not group_results.empty and 'Original_Names' in group_results.columns:
+                    group_results['Original_Sample_Names'] = group_results['Original_Names'].apply(lambda x: ', '.join(x))
+                    drop_cols = ['Original_Names', 'Is_Group']
+                    if 'Is_Replicate' in group_results.columns:
+                        drop_cols.append('Is_Replicate')
+                    group_results = group_results.drop(columns=[col for col in drop_cols if col in group_results.columns])
+                    group_results.to_excel(writer, sheet_name="Group_Statistics", index=False)
+                    
+                    if logger:
+                        logger.debug("Group_Statistics sheet created successfully")
             
             # Sample name mapping
-            name_mapping_df = pd.DataFrame({
-                'Standardized_Name': results_df['Sample'],
-                'Original_Names': results_df['Original_Sample_Names']
-            })
-            name_mapping_df.to_excel(writer, sheet_name="Sample_Name_Mapping", index=False)
+            if 'Is_Group' in sample_stats.columns:
+                group_results = sample_stats[sample_stats['Is_Group'] == True].copy()
+                if not group_results.empty and 'Original_Names' in group_results.columns:
+                    group_results['Original_Sample_Names'] = group_results['Original_Names'].apply(lambda x: ', '.join(x))
+                    name_mapping_df = pd.DataFrame({
+                        'Standardized_Name': group_results['Sample'],
+                        'Original_Names': group_results['Original_Sample_Names']
+                    })
+                    name_mapping_df.to_excel(writer, sheet_name="Sample_Name_Mapping", index=False)
             
             # Standard data
             std_data = pd.DataFrame({
@@ -540,7 +630,8 @@ def save_results(output_path, sample_stats, metrics, formula, concentrations,
             
             # Generate plot
             plot_bytes = create_and_save_plot(
-                concentrations, mean_values, sd_values, sample_stats,
+                concentrations, mean_values, sd_values, 
+                sample_stats,
                 fit_func, method, popt, formula, output_png_path, return_bytes=True
             )
             
@@ -561,16 +652,48 @@ def save_results(output_path, sample_stats, metrics, formula, concentrations,
                             pass
                     adjusted_width = (max_length + 2)
                     ws.column_dimensions[column[0].column_letter].width = adjusted_width
+                    
+            if logger:
+                logger.debug(f"Created sheets: {workbook.sheetnames}")
     else:
-        # CSV output (same as before)
+        # CSV output with similar modifications
         output_str = io.StringIO()
         
-        # Write sample analysis results
-        output_str.write("=== Analysis Results ===\n")
-        results_df = sample_stats.copy()
-        results_df['Original_Sample_Names'] = results_df['Original_Names'].apply(lambda x: ', '.join(x))
-        results_df = results_df.drop(columns=['Original_Names'])
-        results_df.to_csv(output_str, index=False)
+        # 1. Individual sample results
+        output_str.write("=== Individual Sample Results ===\n")
+        if 'Is_Group' in sample_stats.columns and 'Is_Replicate' in sample_stats.columns:
+            individual_results = sample_stats[(~sample_stats['Is_Group']) & (~sample_stats['Is_Replicate'])].copy()
+        else:
+            individual_results = pd.DataFrame()
+            
+        if not individual_results.empty:
+            individual_cols = ['Sample', 'Base_Sample_Name', 'Absorbance', 'Concentration']
+            individual_cols = [col for col in individual_cols if col in individual_results.columns]
+            individual_results = individual_results[individual_cols].copy()
+            individual_results.to_csv(output_str, index=False)
+        
+        # 2. Replicate statistics
+        output_str.write("\n=== Replicate Statistics ===\n")
+        if 'Is_Replicate' in sample_stats.columns:
+            replicate_results = sample_stats[sample_stats['Is_Replicate'] == True].copy()
+            
+            if not replicate_results.empty:
+                drop_cols = ['Is_Group', 'Is_Replicate']
+                replicate_results = replicate_results.drop(columns=[col for col in drop_cols if col in replicate_results.columns])
+                replicate_results.to_csv(output_str, index=False)
+        
+        # 3. Group statistics results
+        output_str.write("\n=== Group Statistics ===\n")
+        if 'Is_Group' in sample_stats.columns:
+            group_results = sample_stats[sample_stats['Is_Group'] == True].copy()
+            
+            if not group_results.empty and 'Original_Names' in group_results.columns:
+                group_results['Original_Sample_Names'] = group_results['Original_Names'].apply(lambda x: ', '.join(x))
+                drop_cols = ['Original_Names', 'Is_Group']
+                if 'Is_Replicate' in group_results.columns:
+                    drop_cols.append('Is_Replicate')
+                group_results = group_results.drop(columns=[col for col in drop_cols if col in group_results.columns])
+                group_results.to_csv(output_str, index=False)
         
         # Write standard data
         output_str.write("\n=== Standard Data ===\n")
@@ -675,44 +798,137 @@ def process_data_and_calculate_conc(file_path, sheet_name, output_path, method, 
         log_to_file(f"  AIC = {metrics['AIC']:.6f}")
         log_to_file(f"  BIC = {metrics['BIC']:.6f}")
 
-        # Process sample data
+        # Process sample data - now with three levels of statistics
         empty_row_idx = df.index[df.iloc[:, 1:].isna().all(axis=1)].min()
         log_to_file("\n5. Processing sample data:")
         sample_stats = process_sample_data(df, empty_row_idx, logger)
         
-        # Calculate concentrations
-        log_to_file("\n6. Calculating concentrations:")
-        sample_stats['Concentration'] = sample_stats['Absorbance_Mean'].apply(
-            lambda x: inverse_fit_func(fit_func, x, method, popt)
-        )
+        logger.debug(f"Sample_stats columns: {sample_stats.columns.tolist()}")
         
-        # Calculate concentration statistics
-        for stat in ['SD', 'SE']:
-            stat_col = f'Absorbance_{stat}'
-            if stat_col in sample_stats.columns:
-                sample_stats[f'Concentration_{stat}'] = sample_stats.apply(
+        # Calculate concentrations for each level
+        log_to_file("\n6. Calculating concentrations:")
+        
+        # 1. Calculate for individual samples
+        ind_mask = (~sample_stats['Is_Group']) & (~sample_stats['Is_Replicate'])
+        if 'Absorbance' in sample_stats.columns and any(ind_mask):
+            logger.debug("Calculating concentrations for individual samples")
+            sample_stats.loc[ind_mask, 'Concentration'] = \
+                sample_stats.loc[ind_mask, 'Absorbance'].apply(
+                lambda x: inverse_fit_func(fit_func, x, method, popt)
+            )
+            
+            logger.debug(f"Individual samples after concentration calculation (first 3):\n{sample_stats[ind_mask].head(3).to_string()}")
+        
+        # 2. Calculate for replicate statistics
+        rep_mask = sample_stats['Is_Replicate'] == True
+        if 'Absorbance_Mean' in sample_stats.columns and any(rep_mask):
+            logger.debug("Calculating concentrations for replicate statistics")
+            sample_stats.loc[rep_mask, 'Concentration'] = \
+                sample_stats.loc[rep_mask, 'Absorbance_Mean'].apply(
+                lambda x: inverse_fit_func(fit_func, x, method, popt)
+            )
+            
+            # Calculate concentration statistics for replicates
+            for stat in ['SD', 'SE']:
+                stat_col = f'Absorbance_{stat}'
+                if stat_col in sample_stats.columns:
+                    sample_stats.loc[rep_mask, f'Concentration_{stat}'] = sample_stats[rep_mask].apply(
+                        lambda row: (
+                            inverse_fit_func(fit_func, row['Absorbance_Mean'] + row[stat_col], method, popt) -
+                            inverse_fit_func(fit_func, row['Absorbance_Mean'] - row[stat_col], method, popt)
+                        ) / 2 if not pd.isna(row[stat_col]) else np.nan,
+                        axis=1
+                    )
+            
+            if 'Absorbance_SE' in sample_stats.columns and 'CI_95' in sample_stats.columns:
+                sample_stats.loc[rep_mask, 'Concentration_CI_95'] = sample_stats[rep_mask].apply(
                     lambda row: (
-                        inverse_fit_func(fit_func, row['Absorbance_Mean'] + row[stat_col], method, popt) -
-                        inverse_fit_func(fit_func, row['Absorbance_Mean'] - row[stat_col], method, popt)
-                    ) / 2,
+                        inverse_fit_func(fit_func, row['Absorbance_Mean'] + row['CI_95'], method, popt) -
+                        inverse_fit_func(fit_func, row['Absorbance_Mean'] - row['CI_95'], method, popt)
+                    ) / 2 if row['N'] > 1 and not pd.isna(row['CI_95']) else np.nan,
                     axis=1
                 )
+            
+            logger.debug(f"Replicate statistics after concentration calculation (first 3):\n{sample_stats[rep_mask].head(3).to_string()}")
         
-        if 'Absorbance_SE' in sample_stats.columns:
-            sample_stats['Concentration_CI_95'] = sample_stats.apply(
-                lambda row: (
-                    inverse_fit_func(fit_func, row['Absorbance_Mean'] + row['CI_95'], method, popt) -
-                    inverse_fit_func(fit_func, row['Absorbance_Mean'] - row['CI_95'], method, popt)
-                ) / 2 if row['N'] > 1 else np.nan,
-                axis=1
+        # 3. Calculate for group statistics
+        group_mask = sample_stats['Is_Group'] == True
+        if 'Absorbance_Mean' in sample_stats.columns and any(group_mask):
+            logger.debug("Calculating concentrations for group statistics")
+            sample_stats.loc[group_mask, 'Concentration'] = \
+                sample_stats.loc[group_mask, 'Absorbance_Mean'].apply(
+                lambda x: inverse_fit_func(fit_func, x, method, popt)
             )
+            
+            # Calculate concentration statistics for groups
+            for stat in ['SD', 'SE']:
+                stat_col = f'Absorbance_{stat}'
+                if stat_col in sample_stats.columns:
+                    sample_stats.loc[group_mask, f'Concentration_{stat}'] = sample_stats[group_mask].apply(
+                        lambda row: (
+                            inverse_fit_func(fit_func, row['Absorbance_Mean'] + row[stat_col], method, popt) -
+                            inverse_fit_func(fit_func, row['Absorbance_Mean'] - row[stat_col], method, popt)
+                        ) / 2 if not pd.isna(row[stat_col]) else np.nan,
+                        axis=1
+                    )
+            
+            if 'Absorbance_SE' in sample_stats.columns and 'CI_95' in sample_stats.columns:
+                sample_stats.loc[group_mask, 'Concentration_CI_95'] = sample_stats[group_mask].apply(
+                    lambda row: (
+                        inverse_fit_func(fit_func, row['Absorbance_Mean'] + row['CI_95'], method, popt) -
+                        inverse_fit_func(fit_func, row['Absorbance_Mean'] - row['CI_95'], method, popt)
+                    ) / 2 if row['N'] > 1 and not pd.isna(row['CI_95']) else np.nan,
+                    axis=1
+                )
+            
+            logger.debug(f"Group statistics after concentration calculation (first 3):\n{sample_stats[group_mask].head(3).to_string()}")
         
-        # Record sample results
+        # Record sample results at all three levels
         log_to_file("\nSample results:")
-        for _, row in sample_stats.iterrows():
-            log_to_file(f"\nSample: {row['Sample']}")
-            log_to_file(f"  Absorbance: {row['Absorbance_Mean']:.4f} ± {row['Absorbance_SD']:.4f}")
-            log_to_file(f"  Calculated concentration: {row['Concentration']:.4f}")
+        
+        # 1. Record individual sample results
+        individual_results = sample_stats[(~sample_stats['Is_Group']) & (~sample_stats['Is_Replicate'])].copy()
+        if not individual_results.empty:
+            log_to_file("\nIndividual sample measurements:")
+            for _, row in individual_results.head(5).iterrows():  # Just show first 5 to avoid very long logs
+                log_to_file(f"Sample: {row['Sample']}")
+                log_to_file(f"  Absorbance: {row['Absorbance']:.4f}")
+                if 'Concentration' in row and not pd.isna(row['Concentration']):
+                    log_to_file(f"  Calculated concentration: {row['Concentration']:.4f}")
+                else:
+                    log_to_file(f"  Calculated concentration: N/A")
+            if len(individual_results) > 5:
+                log_to_file(f"  ... plus {len(individual_results)-5} more individual measurements")
+        
+        # 2. Record replicate statistics results
+        replicate_results = sample_stats[sample_stats['Is_Replicate'] == True].copy()
+        if not replicate_results.empty:
+            log_to_file("\nReplicate statistics:")
+            for _, row in replicate_results.iterrows():
+                log_to_file(f"\nSample replicate: {row['Sample']}")
+                log_to_file(f"  Absorbance: {row['Absorbance_Mean']:.4f} ± {row['Absorbance_SD']:.4f}")
+                log_to_file(f"  Number of measurements: {row['N']}")
+                if 'Concentration' in row and not pd.isna(row['Concentration']):
+                    log_to_file(f"  Calculated concentration: {row['Concentration']:.4f}")
+                    if 'Concentration_SD' in row and not pd.isna(row['Concentration_SD']):
+                        log_to_file(f"  Concentration SD: {row['Concentration_SD']:.4f}")
+                else:
+                    log_to_file(f"  Calculated concentration: N/A")
+        
+        # 3. Record group statistics results
+        group_results = sample_stats[sample_stats['Is_Group'] == True].copy()
+        if not group_results.empty:
+            log_to_file("\nGroup statistics:")
+            for _, row in group_results.iterrows():
+                log_to_file(f"\nSample group: {row['Sample']}")
+                log_to_file(f"  Absorbance: {row['Absorbance_Mean']:.4f} ± {row['Absorbance_SD']:.4f}")
+                log_to_file(f"  Number of measurements: {row['N']}")
+                if 'Concentration' in row and not pd.isna(row['Concentration']):
+                    log_to_file(f"  Calculated concentration: {row['Concentration']:.4f}")
+                    if 'Concentration_SD' in row and not pd.isna(row['Concentration_SD']):
+                        log_to_file(f"  Concentration SD: {row['Concentration_SD']:.4f}")
+                else:
+                    log_to_file(f"  Calculated concentration: N/A")
             
         # Data quality check
         warnings = validate_data_quality(sample_stats)
@@ -734,7 +950,7 @@ def process_data_and_calculate_conc(file_path, sheet_name, output_path, method, 
             output_path, sample_stats, metrics, formula,
             concentrations, mean_values, sd_values, se_values,
             n_std_replicates, warnings, fit_func, method, popt,
-            plot_png_path, file_type=file_type
+            plot_png_path, file_type=file_type, logger=logger
         )
         
         # Completion message
@@ -757,6 +973,44 @@ def process_data_and_calculate_conc(file_path, sheet_name, output_path, method, 
         logger.error(error_msg)
         log_to_file(f"\nERROR: {error_msg}")
         raise
+
+def determine_best_fit(concentrations, mean_values, logger, verbose=False):
+    """
+    Determine the best fitting method based on AIC and RMSE
+    """
+    methods = ['linear', '4', '5']
+    best_method = None
+    best_metrics = None
+    best_y_fit = None
+    best_popt = None
+    best_formula = ""
+    best_fit_func = None
+    
+    for method in methods:
+        try:
+            init_params = get_initial_params(mean_values, concentrations) if method in ['4', '5'] else None
+            fit_func, popt, y_fit, n_params, formula = fit_curve(concentrations, mean_values, method, init_params, verbose)
+            metrics = calculate_fit_metrics(mean_values, y_fit, n_params)
+
+            if best_metrics is None or metrics['AIC'] < best_metrics['AIC']:
+                best_method = method
+                best_metrics = metrics
+                best_y_fit = y_fit
+                best_popt = popt
+                best_formula = formula
+                best_fit_func = fit_func
+            elif metrics['AIC'] == best_metrics['AIC'] and metrics['RMSE'] < best_metrics['RMSE']:
+                best_method = method
+                best_metrics = metrics
+                best_y_fit = y_fit
+                best_popt = popt
+                best_formula = formula
+                best_fit_func = fit_func
+
+        except RuntimeError:
+            logger.warning(f"Fitting failed for {method} method")
+    
+    return best_method, best_metrics, best_y_fit, best_popt, best_formula, best_fit_func
 
 def main():
     """Main entry point"""
@@ -784,13 +1038,20 @@ def main():
     else:
         output_path = Path(args.output)
     
+    # Always enable verbose mode for debugging
+    args.verbose = True
     logger = setup_logging(input_path.parent, args.verbose)
+    logger.info("DEBUG MODE ENABLED - Detailed log information will be shown")
 
     try:
         num_samples = process_data_and_calculate_conc(
             args.input, args.sheet, output_path, args.method, logger, args.verbose
         )
         logger.info(f"Processing completed: analyzed {num_samples} samples")
+        logger.info("\nNOTE: Please check all worksheets in the Excel file. This version creates separate sheets for:")
+        logger.info("- Individual_Results: Contains each individual measurement")
+        logger.info("- Replicate_Statistics: Contains statistics for identical sample names (duplicates)")
+        logger.info("- Group_Statistics: Contains statistics for each base sample group")
         return 0
     except Exception as e:
         logger.error(f"Error occurred: {str(e)}")
